@@ -95,6 +95,12 @@ def my_kernel(x: torch.Tensor) -> torch.Tensor:
    When enabled, tensor shapes are treated as compile-time constants for optimization. Default is ``True``.
    Set ``HELION_STATIC_SHAPES=0`` the default if you need a compiled kernel instance to serve many shape variants.
 
+.. autoattribute:: Settings.fast_math
+
+   If ``True``, enable fast math approximations. This activates both Helion-level optimizations
+   (e.g. fast sigmoid) and Inductor-level fast math (flush-to-zero exp, fast online softmax,
+   etc.). May reduce numerical precision. Default is ``False``. Controlled by ``HELION_FAST_MATH=1``.
+
 .. autoattribute:: Settings.persistent_reserved_sms
 
    Reserve this many streaming multiprocessors when launching persistent kernels. Default is ``0`` (use all SMs).
@@ -220,6 +226,8 @@ Helion stores the best-performing configs discovered during autotuning in an on-
 
 - `HELION_CACHE_DIR`: Override the directory used to store cache entries. Defaults to PyTorch’s `torch._inductor` cache path (typically `/tmp/torchinductor_$USER/helion`).
 - `HELION_SKIP_CACHE`: Set to `1` to ignore cached entries and force the autotuner to re-run even if a matching artifact exists.
+- `TRITON_STORE_BINARY_ONLY`: During autotuning, Helion sets this Triton environment variable to `1` by default, skipping storage of intermediate representations (`.ttir`, `.ttgir`, `.llir`, etc.) and keeping only compiled binaries and metadata. This reduces Triton cache disk usage by approximately 40%. To retain IRs for debugging, set `TRITON_STORE_BINARY_ONLY=0` before running.
+- `HELION_KEEP_TRITON_CACHE`: Set to `1` to keep the Triton cache entries for all candidate configs evaluated during autotuning. By default, Helion uses an ephemeral Triton cache directory during autotuning and only preserves the winning config's cache entry, avoiding significant disk bloat. Enable this if you need to inspect the compiled artifacts of non-winning configs for debugging.
 
 See :class:`helion.autotuner.LocalAutotuneCache` for details on cache keys and behavior.
 
@@ -292,6 +300,7 @@ Built-in values for ``HELION_AUTOTUNER`` include ``"LFBOTreeSearch"`` (default),
 | ``TRITON_F32_DEFAULT`` | ``dot_precision`` | Sets default floating-point precision for Triton dot products (``"tf32"``, ``"tf32x3"``, ``"ieee"``). |
 | ``HELION_INDEX_DTYPE`` | ``index_dtype`` | Choose the index dtype (accepts any ``torch.<dtype>`` name, e.g. ``int64``), or set to ``auto``/unset to allow Helion to pick ``int32`` vs ``int64`` based on input sizes. |
 | ``HELION_STATIC_SHAPES`` | ``static_shapes`` | Set to ``0``/``false`` to disable global static shape specialization. |
+| ``HELION_FAST_MATH`` | ``fast_math`` | Set to ``1`` to enable fast math approximations (Helion-level and Inductor-level). May reduce numerical precision. |
 | ``HELION_PERSISTENT_RESERVED_SMS`` | ``persistent_reserved_sms`` | Reserve this many streaming multiprocessors when launching persistent kernels (``0`` uses all available SMs). |
 | ``HELION_FORCE_AUTOTUNE`` | ``force_autotune`` | Force the autotuner to run even when explicit configs are provided. |
 | ``HELION_AUTOTUNE_FORCE_PERSISTENT`` | ``autotune_force_persistent`` | Restrict ``pid_type`` to persistent kernel strategies during config search. |
@@ -313,6 +322,7 @@ Built-in values for ``HELION_AUTOTUNER`` include ``"LFBOTreeSearch"`` (default),
 | ``HELION_AUTOTUNE_PROGRESS_BAR`` | ``autotune_progress_bar`` | Enable or disable the progress bar UI during autotuning. |
 | ``HELION_AUTOTUNE_IGNORE_ERRORS`` | ``autotune_ignore_errors`` | Continue autotuning even when recoverable runtime errors occur. |
 | ``HELION_AUTOTUNE_CONFIG_OVERRIDES`` | ``autotune_config_overrides`` | Supply JSON forcing particular autotuner config key/value pairs. |
+| ``TRITON_STORE_BINARY_ONLY`` | Triton (autotuning) | Set to ``1`` during autotuning to skip Triton intermediate IRs, reducing cache size ~40%. Set to ``0`` to retain IRs for debugging. |
 | ``HELION_CACHE_DIR`` | ``LocalAutotuneCache`` | Override the on-disk directory used for cached autotuning artifacts. |
 | ``HELION_SKIP_CACHE`` | ``LocalAutotuneCache`` | When set to ``1``, ignore cached autotuning entries and rerun searches. |
 | ``HELION_ASSERT_CACHE_HIT`` | ``AutotuneCacheBase`` | When set to ``1``, require a cache hit; raises ``CacheAssertionError`` on cache miss with detailed diagnostics. |
