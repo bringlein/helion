@@ -21,8 +21,8 @@ from .. import exc
 from .._compat import is_hip
 from .._compat import supports_tf32_precision_on_amd
 from ..autotuner.effort_profile import AutotuneEffort
-from ..autotuner.effort_profile import get_effort_profile
 from ..autotuner.effort_profile import InitialPopulation
+from ..autotuner.effort_profile import get_effort_profile
 from .ref_mode import RefMode
 
 if TYPE_CHECKING:
@@ -232,7 +232,7 @@ def _get_initial_population_strategy(
     # Priority: setting_override > env var > effort profile default
     if setting_override is not None:
         return InitialPopulationStrategy(setting_override)
-    
+
     env_value = os.environ.get("HELION_AUTOTUNER_INITIAL_POPULATION", "").lower()
     if env_value == "":
         # No override, use the default from effort profile
