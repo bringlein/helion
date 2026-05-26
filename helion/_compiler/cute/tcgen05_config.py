@@ -1291,9 +1291,15 @@ class CuteTcgen05Config:
                 cast("PidTypeLiteral", TCGEN05_TWO_CTA_SEED_PID_TYPE),
             )
         if not allow_persistent_pid_types:
-            self.config_spec.disallow_pid_type("persistent_blocked")
+            self.config_spec.disallow_pid_type(
+                "persistent_blocked",
+                log_reason="CuTe tcgen05 kernel does not allow persistent_blocked",
+            )
             if not allow_cluster_m2_edge_k_tail_family:
-                self.config_spec.disallow_pid_type("persistent_interleaved")
+                self.config_spec.disallow_pid_type(
+                    "persistent_interleaved",
+                    log_reason="CuTe tcgen05 kernel does not allow persistent_interleaved",
+                )
         if allow_cluster_m2_search:
             assert cluster_m2_static_k_int is not None
             self.allow_cluster_m2_search(

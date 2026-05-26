@@ -472,6 +472,7 @@ def enforce_dot_requirements(lhs: torch.Tensor, rhs: torch.Tensor) -> None:
                 allow_cluster_m2_edge_k_tail_family=allow_edge_cluster_m2_search,
                 ab_stages_three_dtype_bytes=ab_dtype_bytes,
                 ab_stages_three_device=lhs.device,
+                log_reason="matmul kernel with CuTe tcgen05 backend",
             )
             for axis_name, shape, max_size in (
                 ("m", m, max_search_m),

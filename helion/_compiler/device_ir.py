@@ -2248,11 +2248,19 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
             # xyz is not supported with shared program IDs. Non-tcgen05
             # persistent kernels are allowed; tcgen05 persistent has a
             # single-root scheduler/grid contract today.
-            config_spec.disallow_pid_type("xyz")
+            config_spec.disallow_pid_type(
+                "xyz",
+                log_reason="multi-root kernels don't support xyz pid_type",
+            )
             if config_spec.cute_tcgen05_search_enabled:
                 # The tcgen05 persistent launch grid is derived from a single
                 # root's PID space today. Keep persistent pid types out of
                 # multi-root autotune until the scheduler/grid spans all cases.
+                removed_persistent = [
+                    pid_type
+                    for pid_type in config_spec.allowed_pid_types
+                    if pid_type in ("persistent_blocked", "persistent_interleaved")
+                ]
                 non_persistent_pid_types = tuple(
                     pid_type
                     for pid_type in config_spec.allowed_pid_types
@@ -2266,6 +2274,17 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                         "persistent-only mode or use a single root loop."
                     )
                 config_spec.allowed_pid_types = non_persistent_pid_types
+                if removed_persistent:
+                    import logging
+
+                    from helion.autotuner import config_spec as config_spec_module
+
+                    if config_spec_module.log.isEnabledFor(logging.INFO):
+                        config_spec_module.log.info(
+                            "Autotuner feature restriction: multi-root tcgen05 kernel "
+                            "disallows persistent pid_types (%s)",
+                            ", ".join(removed_persistent),
+                        )
 
         # Count all device loads and stores and register tunables
         (

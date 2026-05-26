@@ -420,13 +420,32 @@ class ConfigSpec:
         self.range_flattens._remove_duplicates()
         self.static_ranges._remove_duplicates()
 
-    def disallow_pid_type(self, pid_type: PidTypeLiteral) -> None:
-        """Disallow a pid_type from being used in the config."""
+    def disallow_pid_type(
+        self,
+        pid_type: PidTypeLiteral,
+        *,
+        log_reason: str | None = None,
+    ) -> None:
+        """Disallow a pid_type from being used in the config.
+
+        Args:
+            pid_type: The pid_type to disallow
+            log_reason: Optional reason for disabling (triggers logging if provided)
+        """
+        if pid_type not in self.allowed_pid_types:
+            return
 
         self.allowed_pid_types = tuple(
             [x for x in self.allowed_pid_types if x != pid_type]
         )
         assert self.allowed_pid_types
+
+        if log_reason is not None:
+            log.info(
+                "Autotuner feature restriction: pid_type=%r disabled (%s)",
+                pid_type,
+                log_reason,
+            )
 
     @property
     def cute_tcgen05_search_enabled(self) -> bool:
@@ -512,8 +531,25 @@ class ConfigSpec:
     ) -> None:
         self._cute_tcgen05_config.num_epi_warps_validation_choices = value
 
-    def restrict_tcgen05_cluster_m_search(self, choices: tuple[int, ...]) -> None:
+    def restrict_tcgen05_cluster_m_search(
+        self,
+        choices: tuple[int, ...],
+        *,
+        log_reason: str | None = None,
+    ) -> None:
+        """Restrict cluster_m search choices.
+
+        Args:
+            choices: Allowed cluster_m values
+            log_reason: Optional reason for logging (triggers INFO logging if provided)
+        """
         self._cute_tcgen05_config.restrict_cluster_m_search(choices)
+        if log_reason is not None and log.isEnabledFor(logging.INFO):
+            log.info(
+                "Autotuner feature restriction: tcgen05_cluster_m restricted to %s (%s)",
+                choices,
+                log_reason,
+            )
 
     def allow_tcgen05_cluster_m2_search(
         self,
@@ -521,15 +557,43 @@ class ConfigSpec:
         static_k: int,
         max_k_tiles: int = TCGEN05_TWO_CTA_MAX_K_TILES,
         allow_edge_k_tail_family: bool = False,
+        log_reason: str | None = None,
     ) -> None:
+        """Enable cluster_m=2 search.
+
+        Args:
+            static_k: Static K dimension size
+            max_k_tiles: Maximum K tiles
+            allow_edge_k_tail_family: Allow edge K tail family
+            log_reason: Optional reason for logging (triggers INFO logging if provided)
+        """
         self._cute_tcgen05_config.allow_cluster_m2_search(
             static_k=static_k,
             max_k_tiles=max_k_tiles,
             allow_edge_k_tail_family=allow_edge_k_tail_family,
         )
+        if log_reason is not None and log.isEnabledFor(logging.INFO):
+            log.info(
+                "Autotuner feature restriction: tcgen05 cluster_m=2 search enabled (%s)",
+                log_reason,
+            )
 
-    def allow_tcgen05_target1_tvm_ffi_seed(self) -> None:
+    def allow_tcgen05_target1_tvm_ffi_seed(
+        self,
+        *,
+        log_reason: str | None = None,
+    ) -> None:
+        """Enable Target1 TVM FFI seed for tcgen05.
+
+        Args:
+            log_reason: Optional reason for logging (triggers INFO logging if provided)
+        """
         self._cute_tcgen05_config.allow_target1_tvm_ffi_seed()
+        if log_reason is not None and log.isEnabledFor(logging.INFO):
+            log.info(
+                "Autotuner feature restriction: tcgen05 Target1 TVM FFI seed enabled (%s)",
+                log_reason,
+            )
 
     @staticmethod
     def _tcgen05_cluster_m2_bk_is_valid(
@@ -551,11 +615,24 @@ class ConfigSpec:
         *,
         dtype_bytes: int,
         device: torch.device,
+        log_reason: str | None = None,
     ) -> None:
+        """Enable 3-stage async copy search.
+
+        Args:
+            dtype_bytes: Data type size in bytes
+            device: Target device
+            log_reason: Optional reason for logging (triggers INFO logging if provided)
+        """
         self._cute_tcgen05_config.allow_ab_stages_three_search(
             dtype_bytes=dtype_bytes,
             device=device,
         )
+        if log_reason is not None and log.isEnabledFor(logging.INFO):
+            log.info(
+                "Autotuner feature restriction: tcgen05 ab_stages=3 search enabled (%s)",
+                log_reason,
+            )
 
     @staticmethod
     def _cute_per_cta_ab_smem_budget_bytes(device: torch.device) -> int:
@@ -591,8 +668,25 @@ class ConfigSpec:
     ) -> None:
         self._cute_tcgen05_config._fix_cluster_m1_persistent_search_config(config)
 
-    def restrict_tcgen05_num_epi_warps_search(self, choices: tuple[int, ...]) -> None:
+    def restrict_tcgen05_num_epi_warps_search(
+        self,
+        choices: tuple[int, ...],
+        *,
+        log_reason: str | None = None,
+    ) -> None:
+        """Restrict num_epi_warps search choices.
+
+        Args:
+            choices: Allowed num_epi_warps values
+            log_reason: Optional reason for logging (triggers INFO logging if provided)
+        """
         self._cute_tcgen05_config.restrict_num_epi_warps_search(choices)
+        if log_reason is not None and log.isEnabledFor(logging.INFO):
+            log.info(
+                "Autotuner feature restriction: tcgen05_num_epi_warps restricted to %s (%s)",
+                choices,
+                log_reason,
+            )
 
     def restrict_tcgen05_num_epi_warps_validation(
         self, choices: tuple[int, ...]
@@ -608,7 +702,19 @@ class ConfigSpec:
         allow_cluster_m2_edge_k_tail_family: bool = False,
         ab_stages_three_dtype_bytes: int | None = None,
         ab_stages_three_device: torch.device | None = None,
+        log_reason: str | None = None,
     ) -> None:
+        """Narrow tcgen05 autotune search to validated configurations.
+
+        Args:
+            allow_persistent_pid_types: Allow persistent pid types
+            allow_cluster_m2_search: Enable cluster_m=2 search
+            cluster_m2_static_k: Static K for cluster_m=2
+            allow_cluster_m2_edge_k_tail_family: Allow edge K tail family
+            ab_stages_three_dtype_bytes: Enable ab_stages=3 for this dtype
+            ab_stages_three_device: Device for ab_stages=3 SMEM budget check
+            log_reason: Optional reason for logging (triggers INFO logging if provided)
+        """
         self._cute_tcgen05_config.narrow_autotune_to_validated_configs(
             allow_persistent_pid_types=allow_persistent_pid_types,
             allow_cluster_m2_search=allow_cluster_m2_search,
@@ -617,6 +723,11 @@ class ConfigSpec:
             ab_stages_three_dtype_bytes=ab_stages_three_dtype_bytes,
             ab_stages_three_device=ab_stages_three_device,
         )
+        if log_reason is not None and log.isEnabledFor(logging.INFO):
+            log.info(
+                "Autotuner feature restriction: tcgen05 search narrowed to validated configs (%s)",
+                log_reason,
+            )
 
     def supports_config_key(self, key: str) -> bool:
         return self.backend.supports_config_key(key)

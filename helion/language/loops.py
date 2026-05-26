@@ -417,12 +417,21 @@ def _add_config_choices(
             # L2 grouping now supports 3D+ grids by applying to innermost 2 dimensions
             config_spec.l2_groupings.append(L2GroupingSpec(block_ids))
         if not _allow_use_yz_grid(config_spec, block_ids):
-            config_spec.disallow_pid_type("xyz")
+            config_spec.disallow_pid_type(
+                "xyz",
+                log_reason="kernel configuration does not support xyz pid_type",
+            )
         # Data-dependent bounds require persistent kernels to ensure cudagraphability
         # (the grid size can't be data-dependent for non-persistent kernels)
         if has_data_dependent_bounds:
-            config_spec.disallow_pid_type("flat")
-            config_spec.disallow_pid_type("xyz")
+            config_spec.disallow_pid_type(
+                "flat",
+                log_reason="data-dependent bounds require persistent kernels",
+            )
+            config_spec.disallow_pid_type(
+                "xyz",
+                log_reason="data-dependent bounds require persistent kernels",
+            )
         # just one set of choices for when we have persistent kernel loop
         _add_config_range_choice(block_ids)
     else:

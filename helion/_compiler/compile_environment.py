@@ -277,7 +277,12 @@ class CompileEnvironment:
                 "flat",
                 "xyz",
             ):
-                self.config_spec.disallow_pid_type(pid_type)
+                reason = (
+                    "autotune_force_persistent enabled"
+                    if settings.autotune_force_persistent
+                    else "distributed mode requires persistent kernels"
+                )
+                self.config_spec.disallow_pid_type(pid_type, log_reason=reason)
 
         if dist.is_initialized():
             from torch._C._distributed_c10d import _SymmetricMemory

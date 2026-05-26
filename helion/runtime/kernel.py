@@ -552,7 +552,9 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                     )
                 )
                 if self.env.config_spec.cute_tcgen05_identity_matmul_store_detected:
-                    self.env.config_spec.allow_tcgen05_target1_tvm_ffi_seed()
+                    self.env.config_spec.allow_tcgen05_target1_tvm_ffi_seed(
+                        log_reason="kernel has identity matmul store pattern for Target1 TVM FFI"
+                    )
                 if not self.env.settings.disable_autotuner_heuristics:
                     for seed_config in self.env.config_spec.autotune_seed_configs():
                         if (
