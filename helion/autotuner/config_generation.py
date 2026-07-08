@@ -308,12 +308,17 @@ class ConfigGeneration:
         self._repair_cute_num_threads(result)
         return result
 
-    def unflatten(self, flat_values: FlatConfig) -> Config:
+    def unflatten(self, flat_values: FlatConfig, *, fix_invalid: bool = True) -> Config:
         """
         Convert a flat configuration back into a full configuration.
 
         Args:
             flat_values: The flat configuration values.
+            fix_invalid: When True (the default, used by user-facing paths),
+                invalid cross-parameter combinations are silently repaired. When
+                False (used by the autotuner search loop), such combinations
+                raise ``InvalidConfig`` so the caller can reject and skip the
+                candidate rather than benchmark a silently mutated duplicate.
 
         Returns:
             The full configuration object.
@@ -330,6 +335,7 @@ class ConfigGeneration:
         config = self.config_spec.flat_config(
             get_next_value,
             advanced_controls_files=self._advanced_controls_files,
+            fix_invalid=fix_invalid,
         )
         assert next(count) == len(flat_values)
         config = self._apply_overrides(config)
@@ -551,7 +557,7 @@ class ConfigGeneration:
         errors: dict[str, int] = {}
         for _ in range(64):
             try:
-                return self.unflatten(self.random_flat())
+                return self.unflatten(self.random_flat(), fix_invalid=False)
             except InvalidConfig as e:
                 msg = str(e)
                 errors[msg] = errors.get(msg, 0) + 1
@@ -634,7 +640,7 @@ class ConfigGeneration:
         # Retry to fill the population to the requested size
         while len(result) < n and attempts < 64:
             with contextlib.suppress(InvalidConfig):
-                result.append(self.unflatten(self.random_flat()))
+                result.append(self.unflatten(self.random_flat(), fix_invalid=False))
             attempts += 1
         return result
 

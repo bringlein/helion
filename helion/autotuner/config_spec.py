@@ -2182,8 +2182,20 @@ class ConfigSpec:
         fn: Callable[[ConfigSpecFragment], object],
         *,
         advanced_controls_files: list[str] | None = None,
+        fix_invalid: bool = True,
     ) -> helion.Config:
-        """Map a flattened version of the config using the given function."""
+        """Map a flattened version of the config using the given function.
+
+        Args:
+            fn: Mapping applied to each config fragment.
+            advanced_controls_files: Optional ACF choices to include.
+            fix_invalid: When True (the default, used by user-facing paths such
+                as ``default_config``), invalid cross-parameter combinations are
+                silently repaired. When False (used by the autotuner search
+                loop), such combinations raise ``InvalidConfig`` so the caller
+                can reject and skip the candidate instead of benchmarking a
+                silently mutated duplicate.
+        """
         config: dict[str, Any] = {}
         for key, field in self._flat_fields().items():
             config[key] = field._flat_config(self, fn)
@@ -2211,7 +2223,7 @@ class ConfigSpec:
         acf_fragment = self._advanced_controls_file_fragment(advanced_controls_files)
         if acf_fragment is not None:
             config["advanced_controls_file"] = fn(acf_fragment)
-        self.normalize(config, _fix_invalid=True)
+        self.normalize(config, _fix_invalid=fix_invalid)
         return helion.Config(**config)
 
 

@@ -876,6 +876,102 @@ class TestAutotuneIgnoreErrors(TestCase):
         self.assertFalse(base_path.with_suffix(".meta.jsonl").exists())
 
 
+class TestConfigFixInvalid(TestCase):
+    """Device-free tests for the search-loop ``fix_invalid`` behavior switch.
+
+    The autotuner search loop generates candidate configs and materializes them
+    via ``ConfigGeneration.unflatten`` / ``ConfigSpec.flat_config``. User-facing
+    paths repair invalid cross-parameter combinations (``fix_invalid=True``,
+    the default), while the search loop rejects them (``fix_invalid=False``) so
+    invalid candidates are skipped instead of silently mutated into duplicates.
+    """
+
+    def _bare_spec(self):
+        from helion._compiler.backend import TritonBackend
+        from helion.autotuner.config_spec import ConfigSpec
+
+        return ConfigSpec(backend=TritonBackend())
+
+    def _invalid_combo_fn(self):
+        """Fragment mapping that forces a non-persistent pid_type together with a
+        non-default ``num_sm_multiplier`` -- a rejected cross-parameter combo."""
+
+        def fn(fragment):
+            choices = getattr(fragment, "choices", None)
+            if isinstance(fragment, EnumFragment) and choices and "flat" in choices:
+                return "flat"
+            if isinstance(fragment, PowerOfTwoFragment):
+                return 4
+            return fragment.default()
+
+        return fn
+
+    def _invalid_flat(self, cg):
+        """A flat config with pid_type='flat' + non-default num_sm_multiplier,
+        which is a rejected cross-parameter combination."""
+        flat = list(cg.default_flat())
+        (pid_idx,), _ = cg._key_to_flat_indices["pid_type"]
+        (sm_idx,), _ = cg._key_to_flat_indices["num_sm_multiplier"]
+        flat[pid_idx] = "flat"
+        flat[sm_idx] = 4
+        return flat
+
+    def test_flat_config_repairs_by_default(self):
+        spec = self._bare_spec()
+        config = spec.flat_config(self._invalid_combo_fn())
+        # Repaired: num_sm_multiplier dropped for the non-persistent pid_type.
+        self.assertEqual(config.config.get("pid_type"), "flat")
+        self.assertIsNone(config.config.get("num_sm_multiplier"))
+
+    def test_flat_config_rejects_when_fix_invalid_false(self):
+        spec = self._bare_spec()
+        with self.assertRaises(exc.InvalidConfig):
+            spec.flat_config(self._invalid_combo_fn(), fix_invalid=False)
+
+    def test_default_config_never_raises(self):
+        # The user-facing fallback config must always materialize.
+        spec = self._bare_spec()
+        config = spec.default_config()
+        self.assertIsInstance(config, helion.Config)
+
+    def test_unflatten_forwards_fix_invalid(self):
+        spec = self._bare_spec()
+        cg = ConfigGeneration(spec)
+        # Build a valid default flat config and confirm both modes round-trip it
+        # identically (raising mode is a no-op for valid configs).
+        default_flat = cg.default_flat()
+        repaired = cg.unflatten(default_flat)
+        rejected_mode = cg.unflatten(default_flat, fix_invalid=False)
+        self.assertEqual(repaired.config, rejected_mode.config)
+
+    def test_unflatten_rejects_invalid_on_search_path(self):
+        # A flat config that encodes a real cross-parameter constraint violation
+        # raises under fix_invalid=False (search path) but is repaired by default.
+        spec = self._bare_spec()
+        cg = ConfigGeneration(spec)
+        invalid_flat = self._invalid_flat(cg)
+
+        # Default (user-facing) path repairs.
+        repaired = cg.unflatten(list(invalid_flat))
+        self.assertEqual(repaired.config.get("pid_type"), "flat")
+        self.assertIsNone(repaired.config.get("num_sm_multiplier"))
+
+        # Search path rejects.
+        with self.assertRaises(exc.InvalidConfig):
+            cg.unflatten(list(invalid_flat), fix_invalid=False)
+
+    def test_make_unbenchmarked_skips_invalid(self):
+        # make_unbenchmarked catches the InvalidConfig raised on the search path
+        # and returns None so the candidate is skipped rather than repaired.
+        spec = self._bare_spec()
+        cg = ConfigGeneration(spec)
+        invalid_flat = self._invalid_flat(cg)
+
+        search = PopulationBasedSearch.__new__(PopulationBasedSearch)
+        search.config_gen = cg
+        self.assertIsNone(search.make_unbenchmarked(invalid_flat))
+
+
 @onlyBackends(["triton"])
 class TestAutotuner(RefEagerTestDisabled, TestCase):
     def setUp(self):

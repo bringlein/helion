@@ -699,7 +699,9 @@ class TestInvalidConfig(RefEagerTestDisabled, TestCase):
         search = DifferentialEvolutionSearch(fake_kernel, args=())
         original_unflatten = search.config_gen.unflatten
 
-        def always_invalid(flat_values):
+        def always_invalid(flat_values, *, fix_invalid):
+            # The search loop must ask for rejection, not repair.
+            assert fix_invalid is False
             raise InvalidConfig("test: forced invalid")
 
         with mock.patch.object(search.config_gen, "unflatten", always_invalid):
@@ -728,7 +730,9 @@ class TestInvalidConfig(RefEagerTestDisabled, TestCase):
         original_unflatten = search.config_gen.unflatten
         call_count = 0
 
-        def selective_unflatten(flat_values):
+        def selective_unflatten(flat_values, *, fix_invalid):
+            # The search loop must ask for rejection, not repair.
+            assert fix_invalid is False
             nonlocal call_count
             idx = call_count
             call_count += 1
@@ -772,7 +776,9 @@ class TestInvalidConfig(RefEagerTestDisabled, TestCase):
         call_count = 0
         original_unflatten = gen.unflatten
 
-        def fail_then_succeed(flat_values):
+        def fail_then_succeed(flat_values, *, fix_invalid):
+            # The search loop must ask for rejection, not repair.
+            assert fix_invalid is False
             nonlocal call_count
             call_count += 1
             if call_count <= 5:
@@ -803,7 +809,11 @@ class TestInvalidConfig(RefEagerTestDisabled, TestCase):
         call_count = 0
         original_unflatten = gen.unflatten
 
-        def intermittent_fail(flat_values):
+        def intermittent_fail(flat_values, *, fix_invalid=True):
+            # random_population calls unflatten in both modes: repair for the
+            # seeded/default first loop, and reject (fix_invalid=False) for the
+            # random retry-fill. Accept either.
+            assert isinstance(fix_invalid, bool)
             nonlocal call_count
             call_count += 1
             if call_count % 2 == 0:

@@ -926,7 +926,7 @@ class PopulationBasedSearch(BaseSearch):
             configuration is invalid.
         """
         try:
-            config = self.config_gen.unflatten(flat_values)
+            config = self.config_gen.unflatten(flat_values, fix_invalid=False)
         except exc.InvalidConfig:
             return None
         return PopulationMember(_unset_fn, [], flat_values, config)
