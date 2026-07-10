@@ -26,6 +26,7 @@ from .variable_origin import AttributeOrigin
 from .variable_origin import GlobalOrigin
 from .variable_origin import NameOrigin
 from .variable_origin import Origin
+from .variable_origin import TensorSizeOrigin
 
 if TYPE_CHECKING:
     import inspect
@@ -263,8 +264,23 @@ class HostFunction:
         expr = env.specialize_expr(expr)
         if not expr.free_symbols:
             return pexpr(expr)
-        if expr in self.expr_to_origin:
-            return self.expr_to_origin[expr].origin.host_str()
+        whole_expr_origin = self.expr_to_origin.get(expr)
+        if whole_expr_origin is not None:
+            # Prefer decomposing the expression into its per-symbol origins when
+            # the whole-expression origin is a tensor size (``T.size(i)``) but
+            # every free symbol has its own origin. A whole-expression
+            # ``TensorSizeOrigin`` may point at a device-phase-local tensor
+            # (e.g. an ``hl.zeros`` result inside one side of an ``hl.barrier``),
+            # whose name is not in scope where this host expression is emitted,
+            # producing ``NameError: name '<T>' is not defined``. The per-symbol
+            # origins (block-size vars, kernel arguments, grid indices) are
+            # always host-valid, so use them instead. Non-decomposable exprs and
+            # non-tensor-size whole-expr origins keep the original behavior.
+            can_decompose = isinstance(
+                whole_expr_origin.origin, TensorSizeOrigin
+            ) and all(sym in self.expr_to_origin for sym in expr.free_symbols)
+            if not can_decompose:
+                return whole_expr_origin.origin.host_str()
         replacements = {}
         for sym in sorted(expr.free_symbols, key=lambda x: x.name):
             assert isinstance(sym, sympy.Symbol)

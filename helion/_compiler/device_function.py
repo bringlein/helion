@@ -521,7 +521,20 @@ class DeviceFunction:
             return self.expr_to_var_info[expr].name
         expr_to_origin = HostFunction.current().expr_to_origin
         if expr in expr_to_origin:
-            return self._lift_sympy_arg(expr)
+            # Prefer per-symbol decomposition when the whole-expression origin is
+            # a tensor size but every free symbol is independently resolvable. A
+            # whole-expression ``TensorSizeOrigin`` can reference a
+            # device-phase-local tensor (e.g. an ``hl.zeros`` result on one side
+            # of an ``hl.barrier``) that is out of scope where this argument is
+            # computed, producing ``NameError``. Per-symbol origins (block sizes,
+            # arguments, grid indices) are always valid here.
+            whole_origin = expr_to_origin[expr].origin
+            can_decompose = isinstance(whole_origin, TensorSizeOrigin) and all(
+                sym in self.expr_to_var_info or sym in expr_to_origin
+                for sym in expr.free_symbols
+            )
+            if not can_decompose:
+                return self._lift_sympy_arg(expr)
         replacements = {}
         for sym in sorted(expr.free_symbols, key=lambda x: x.name):
             assert isinstance(sym, sympy.Symbol)
