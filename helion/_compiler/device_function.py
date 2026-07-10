@@ -41,6 +41,7 @@ from .output_header import reserved_names
 from .source_location import SyntheticLocation
 from .variable_origin import BlockSizeOrigin
 from .variable_origin import GridOrigin
+from .variable_origin import NameOrigin
 from .variable_origin import Origin
 from .variable_origin import TensorSizeOrigin
 
@@ -521,19 +522,27 @@ class DeviceFunction:
             return self.expr_to_var_info[expr].name
         expr_to_origin = HostFunction.current().expr_to_origin
         if expr in expr_to_origin:
-            # Prefer per-symbol decomposition when the whole-expression origin is
-            # a tensor size but every free symbol is independently resolvable. A
-            # whole-expression ``TensorSizeOrigin`` can reference a
-            # device-phase-local tensor (e.g. an ``hl.zeros`` result on one side
-            # of an ``hl.barrier``) that is out of scope where this argument is
-            # computed, producing ``NameError``. Per-symbol origins (block sizes,
-            # arguments, grid indices) are always valid here.
+            # Prefer per-symbol decomposition when the whole-expression origin
+            # may be out of scope where this argument is computed. This covers a
+            # ``TensorSizeOrigin`` pointing at a device-phase-local tensor and a
+            # ``NameOrigin`` for a *compound* kernel-body local (e.g.
+            # ``block_n_size = num_pages_at_once * page_size``) assigned inside a
+            # device loop -- both produce ``NameError`` in the barrier-split host
+            # wrapper. Per-symbol origins (block sizes, arguments, grid indices)
+            # are always valid here. A single bare symbol keeps original behavior.
             whole_origin = expr_to_origin[expr].origin
-            can_decompose = isinstance(whole_origin, TensorSizeOrigin) and all(
+            decomposable = all(
                 sym in self.expr_to_var_info or sym in expr_to_origin
                 for sym in expr.free_symbols
             )
-            if not can_decompose:
+            is_liftable_tensor_size = isinstance(whole_origin, TensorSizeOrigin)
+            is_compound_named_local = isinstance(
+                whole_origin, NameOrigin
+            ) and not isinstance(expr, sympy.Symbol)
+            if not (
+                decomposable
+                and (is_liftable_tensor_size or is_compound_named_local)
+            ):
                 return self._lift_sympy_arg(expr)
         replacements = {}
         for sym in sorted(expr.free_symbols, key=lambda x: x.name):

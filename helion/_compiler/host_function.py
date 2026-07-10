@@ -267,20 +267,31 @@ class HostFunction:
         whole_expr_origin = self.expr_to_origin.get(expr)
         if whole_expr_origin is not None:
             # Prefer decomposing the expression into its per-symbol origins when
-            # the whole-expression origin is a tensor size (``T.size(i)``) but
-            # every free symbol has its own origin. A whole-expression
-            # ``TensorSizeOrigin`` may point at a device-phase-local tensor
-            # (e.g. an ``hl.zeros`` result inside one side of an ``hl.barrier``),
-            # whose name is not in scope where this host expression is emitted,
-            # producing ``NameError: name '<T>' is not defined``. The per-symbol
-            # origins (block-size vars, kernel arguments, grid indices) are
-            # always host-valid, so use them instead. Non-decomposable exprs and
-            # non-tensor-size whole-expr origins keep the original behavior.
-            can_decompose = isinstance(
-                whole_expr_origin.origin, TensorSizeOrigin
-            ) and all(sym in self.expr_to_origin for sym in expr.free_symbols)
-            if not can_decompose:
-                return whole_expr_origin.origin.host_str()
+            # the whole-expression origin refers to something that may not be in
+            # scope where this host expression is emitted. Two cases hit this:
+            #  * a ``TensorSizeOrigin`` (``T.size(i)``) whose tensor is a
+            #    device-phase-local ``hl.zeros``/``hl.full`` result on one side
+            #    of an ``hl.barrier``; and
+            #  * a ``NameOrigin`` for a *compound* kernel-body local (e.g.
+            #    ``block_n_size = num_pages_at_once * page_size``) that is
+            #    assigned inside a device loop and so is not a host-wrapper name.
+            # Both otherwise emit ``NameError: name '<...>' is not defined`` in
+            # the barrier-split host wrapper. The per-symbol origins (block-size
+            # vars, kernel arguments, grid indices) are always host-valid, so use
+            # them instead. A single bare symbol keeps the original behavior.
+            whole_origin = whole_expr_origin.origin
+            decomposable = all(
+                sym in self.expr_to_origin for sym in expr.free_symbols
+            )
+            is_liftable_tensor_size = isinstance(whole_origin, TensorSizeOrigin)
+            is_compound_named_local = (
+                isinstance(whole_origin, NameOrigin)
+                and not isinstance(expr, sympy.Symbol)
+            )
+            if not (
+                decomposable and (is_liftable_tensor_size or is_compound_named_local)
+            ):
+                return whole_origin.host_str()
         replacements = {}
         for sym in sorted(expr.free_symbols, key=lambda x: x.name):
             assert isinstance(sym, sympy.Symbol)
