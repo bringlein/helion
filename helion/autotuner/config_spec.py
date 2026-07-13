@@ -82,6 +82,55 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
+# When True, search-space restriction decisions are logged live (at INFO) the
+# moment they are applied, in addition to being recorded for the end-of-run
+# summary. Set from settings by the autotuner (see BaseSearch._prepare); left
+# False otherwise so restrictions applied outside autotuning stay quiet.
+LOG_RESTRICTIONS_VERBOSE = False
+
+
+def _live_log_restriction(feature: str, reason: str) -> None:
+    """Log a search-space restriction live (at INFO), best-effort.
+
+    Purely diagnostic: any failure here must never disrupt compilation or the
+    autotuner loop.
+    """
+    try:
+        if LOG_RESTRICTIONS_VERBOSE and log.isEnabledFor(logging.INFO):
+            log.info(
+                "Autotuner feature restriction: %s (%s)",
+                feature,
+                reason,
+            )
+    except Exception:  # noqa: BLE001 - diagnostic only, never disrupt autotuning
+        log.debug("Failed to log search-space restriction", exc_info=True)
+
+
+def _record_restriction(
+    store: list[tuple[str, str]],
+    feature: str,
+    reason: str | None,
+) -> None:
+    """Record a search-space restriction and, when verbose, log it live.
+
+    Purely diagnostic: any failure here must never disrupt compilation or the
+    autotuner loop, so the whole body is best-effort.
+    """
+    if reason is None:
+        return
+    try:
+        pair = (feature, reason)
+        # De-duplicate: a shared ConfigSpec can see the same restriction applied
+        # once per matmul op (enforce_dot_requirements runs per dot node), which
+        # would otherwise emit duplicate summary lines. Preserve first-occurrence
+        # order (the field's documented contract).
+        if pair not in store:
+            store.append(pair)
+    except Exception:  # noqa: BLE001 - diagnostic only, never disrupt autotuning
+        log.debug("Failed to record search-space restriction", exc_info=True)
+    _live_log_restriction(feature, reason)
+
+
 _TARGET_DEVICE_CAPABILITY_UNSET = object()
 
 
@@ -234,6 +283,19 @@ class MemoryOpFact(NamedTuple):
     # subscript so it is reduction-AGNOSTIC; ``None`` for a plain slice). The faithful axis key for
     # the full_width_output / input_load_itemsize gates.
     subscript_block_ids: tuple[int | None, ...] = ()
+    # Element stride of the accessed tensor along each subscript position, aligned 1:1 with
+    # ``subscript_block_ids`` (from ``.stride()``). A stride-1 position is the contiguous (coalescing)
+    # axis — the last subscript for a row-major tensor, a different one for a transposed/strided view.
+    subscript_strides: tuple[int, ...] = ()
+    # DISTINCT HBM elements the op's accessed tensor touches: product of its size-hinted shape dims
+    # over NON-broadcast dims (``stride != 0``); a stride-0 dim contributes factor 1 (``0`` if no
+    # resolvable fake tensor). A FULL-EXTENT op has ``accessed_numel`` == the problem numel; a
+    # BROADCAST operand has a STRICTLY SMALLER count — whether it is a small tensor (``bias[N]``,
+    # ``[M,1]``, ``[1,N]``) OR a full-SIZE ``.expand()``/``broadcast_tensors`` view with a stride-0
+    # dim. The faithful signal for per-element HBM traffic at ANY rank/stride, unlike a bare ``ndim``
+    # check (a full-rank ``[M,1]`` broadcast passes ndim) or a shape-only product (a stride-0 expand
+    # passes shape).
+    accessed_numel: int = 0
 
 
 class AccumulatorFact(NamedTuple):
@@ -246,6 +308,42 @@ class AccumulatorFact(NamedTuple):
 
     dim_block_ids: tuple[int | None, ...]
     itemsize: int
+
+
+class PointwiseElementwiseFact(NamedTuple):
+    """Workload facts for a PURE elementwise/pointwise kernel — DEFINED by the absence of any
+    reduction/matmul/accumulator fact (the disjointness rule): if one of those fired, the kernel
+    belongs to that family and this fact is never built. Bandwidth-bound; the compiler defaults it to
+    ``block_size=32`` (which starves HBM), so the seed sizes a saturating tile from these fields
+    (derived from the walker ``MemoryOpFact`` list + block-size specs, plus one graph walk).
+
+    - ``total_numel``: product of the tiled block dims' ``size_hint``s (the problem element count,
+      M*N); the occupancy / grid-saturation input.
+    - ``slab_numel``: the untiled inner slab, in ELEMENTS, that full-extent ops drag per tiled element
+      = ``sum(accessed_numel // total_numel)`` over those ops (flat kernel: 1 per op; rope:
+      heads*head_dim). A BROADCAST operand (``bias[N]``, ``[M,1]``, stride-0) has
+      ``accessed_numel < total_numel`` → amortized → excluded; an OVERSIZED operand still touches the
+      full problem → counted (hence ``>=``).
+    - ``storage_itemsize`` / ``compute_itemsize``: the STORAGE (HBM) and widest COMPUTE (fp32) byte
+      widths that scale slab_numel into the two budgets — ``slab_numel * storage`` = bandwidth traffic,
+      ``slab_numel * compute`` = register cap (compute reads the promoted dtype; a memory op knows only
+      storage). NOTE: the register cap is a COARSE proxy (blind to compute temporaries), but benign —
+      pointwise is memory-bound; its only jobs are relaxing the floor for a heavy slab and capping the
+      transpose-conflict tile. (Mixed-dtype storage uses the max width — a minor seed approximation.)
+    - ``contig_block_ids``: TILED block-ids that are the stride-1 axis of some full-extent op (from
+      ``subscript_strides``, no graph walk). Row-major → the last dim (seed unchanged); transposed →
+      a different dim; two+ entries = a load-vs-store CONFLICT → the seed emits a BALANCED tile.
+    - ``sfu_ops``: count of transcendental (SFU) ops. SFU ops are latency-bound on a distinct unit, so
+      a transcendental-heavy tile wants more warps while an all-FMA tile of the same op count does not
+      — so SFU count (not total op count) drives the num_warps ramp.
+    """
+
+    total_numel: int
+    slab_numel: int
+    storage_itemsize: int
+    compute_itemsize: int
+    contig_block_ids: tuple[int, ...] = ()
+    sfu_ops: int = 0
 
 
 def shrink_block_sizes_for_numel_constraints(
@@ -489,6 +587,12 @@ class ConfigSpec:
         self.static_ranges: BlockIdSequence[StaticRangeSpec] = BlockIdSequence()
 
         self.allowed_pid_types: tuple[PidTypeLiteral, ...] = tuple(VALID_PID_TYPES)
+        # Why each disabled pid_type was removed, for search-space logging.
+        self.disallowed_pid_type_reasons: dict[str, str] = {}
+        # (feature, reason) pairs for every non-pid_type search-space restriction
+        # (currently the tcgen05 narrowing applied per matmul), for search-space
+        # logging. De-duplicated; ordered by first occurrence.
+        self.restriction_reasons: list[tuple[str, str]] = []
         self.max_num_sm_multiplier: int = MAX_NUM_SM_MULTIPLIER
         self.grid_block_ids: list[int] = []
         self.tensor_numel_constraints: list[TensorNumelConstraint] = []
@@ -538,6 +642,7 @@ class ConfigSpec:
         self.reduction_facts: list[ReductionFact] = []
         self.matmul_reduction_epilogue_facts: list[MatmulWithReductionEpilogueFact] = []
         self.accumulator_facts: list[AccumulatorFact] = []
+        self.pointwise_facts: list[PointwiseElementwiseFact] = []
         self.store_indices: list[int] = []
         self.memory_op_facts: list[MemoryOpFact] = []
         self.backend_tunable_fragments = self.backend.tunable_fragments()
@@ -639,13 +744,25 @@ class ConfigSpec:
         self.range_flattens._remove_duplicates()
         self.static_ranges._remove_duplicates()
 
-    def disallow_pid_type(self, pid_type: PidTypeLiteral) -> None:
-        """Disallow a pid_type from being used in the config."""
+    def disallow_pid_type(
+        self, pid_type: PidTypeLiteral, reason: str | None = None
+    ) -> None:
+        """Disallow a pid_type from being used in the config.
 
+        ``reason`` explains why the pid_type is unavailable for this kernel; it is
+        recorded (first reason wins) and surfaced by the search-space logger. When
+        verbose search-space logging is enabled it is also logged live.
+        """
+
+        newly_disabled = pid_type in self.allowed_pid_types
+        if newly_disabled and reason is not None:
+            self.disallowed_pid_type_reasons.setdefault(pid_type, reason)
         self.allowed_pid_types = tuple(
             [x for x in self.allowed_pid_types if x != pid_type]
         )
         assert self.allowed_pid_types
+        if newly_disabled and reason is not None and LOG_RESTRICTIONS_VERBOSE:
+            _live_log_restriction(f"pid_type={pid_type!r} disabled", reason)
 
     @property
     def cute_tcgen05_search_enabled(self) -> bool:
@@ -1164,6 +1281,7 @@ class ConfigSpec:
         allow_cluster_m2_fp8_small_grid: bool = False,
         ab_stages_three_dtype_bytes: int | None = None,
         ab_stages_three_device: torch.device | None = None,
+        reason: str | None = None,
     ) -> None:
         self._cute_tcgen05_config.narrow_autotune_to_validated_configs(
             allow_persistent_pid_types=allow_persistent_pid_types,
@@ -1173,6 +1291,11 @@ class ConfigSpec:
             allow_cluster_m2_fp8_small_grid=allow_cluster_m2_fp8_small_grid,
             ab_stages_three_dtype_bytes=ab_stages_three_dtype_bytes,
             ab_stages_three_device=ab_stages_three_device,
+        )
+        _record_restriction(
+            self.restriction_reasons,
+            "tcgen05 search narrowed to validated configs",
+            reason,
         )
 
     def supports_config_key(self, key: str) -> bool:
