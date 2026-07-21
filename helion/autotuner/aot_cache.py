@@ -169,6 +169,51 @@ def clear_heuristic_cache() -> None:
     _heuristic_file_cache.clear()
 
 
+def _aot_shape_hash(kernel: Any, args: Sequence[object]) -> tuple[str, str, str]:
+    """Recompute the ``_heuristic_results`` key for a kernel+args, matching
+    ``AOTAutotuneCache._heuristic_cache_key``."""
+    user_key = getattr(kernel, "_aot_user_key", None)
+    if user_key is not None:
+        features = extract_key_features(user_key(*args))
+    else:
+        features = extract_shape_features(args)
+    shape_hash = hashlib.sha256(
+        json.dumps(features, sort_keys=True).encode()
+    ).hexdigest()[:16]
+    return (kernel.__code__.co_filename, kernel.name, shape_hash)
+
+
+def mark_aot_config_failed(kernel: Any, args: Sequence[object]) -> bool:
+    """Exclude the currently-selected AOT heuristic config for these args.
+
+    Evicts the cached pick (so the next selection re-picks) and calls the
+    heuristic module's ``mark_failed_<kernel>(*args)`` so the picker skips the
+    failing config. Returns True if another cached candidate remains.
+
+    Standalone (no cache instance) so it can be called from the kernel launch
+    site on ``OutOfResources``. Safe no-op returning False if no heuristic
+    module/mark_failed hook is available.
+    """
+    AOTAutotuneCache._heuristic_results.pop(_aot_shape_hash(kernel, args), None)
+
+    heuristic_file = find_heuristic_file(
+        kernel.__code__.co_filename, kernel_name=kernel.name
+    )
+    if heuristic_file is None:
+        return False
+    module = AOTAutotuneCache._heuristic_modules.get(heuristic_file)
+    if module is None:
+        return False
+    mark_failed = getattr(module, f"mark_failed_{kernel.name}", None)
+    if mark_failed is None:
+        return False
+
+    user_key = getattr(kernel, "_aot_user_key", None)
+    if user_key is not None:
+        return bool(mark_failed(*_flatten_key_value(user_key(*args))))
+    return bool(mark_failed(*args))
+
+
 def load_kernel_source_files(data_dir: Path, hardware_id: str) -> dict[str, str]:
     """
     Load kernel source file mappings from tuned configs JSON.
@@ -704,6 +749,31 @@ class AOTAutotuneCache(AutotuneCacheBase):
             data_dir=self.data_dir,
         )
 
+    def _heuristic_cache_key(
+        self, args: Sequence[object] | None = None
+    ) -> tuple[str, str, str]:
+        """Key into ``_heuristic_results`` for the given args (shape hash)."""
+        if args is None:
+            args = self.args
+        shape_features = self._extract_shape_features(args)
+        shape_hash = hashlib.sha256(
+            json.dumps(shape_features, sort_keys=True).encode()
+        ).hexdigest()[:16]
+        return (
+            self.kernel.kernel.__code__.co_filename,
+            self.kernel.kernel.name,
+            shape_hash,
+        )
+
+    def exclude_current_config(self, args: Sequence[object] | None = None) -> bool:
+        """Exclude the currently-selected heuristic config for these args.
+
+        Returns True if another cached candidate remains (retry worthwhile).
+        """
+        if args is None:
+            args = self.args
+        return mark_aot_config_failed(self.kernel.kernel, args)
+
     def _get_heuristic_config(
         self, args: Sequence[object] | None = None
     ) -> Config | None:
@@ -729,16 +799,10 @@ class AOTAutotuneCache(AutotuneCacheBase):
         kernel_source_file = self.kernel.kernel.__code__.co_filename
 
         # Compute cache key based on shape features
-        shape_features = self._extract_shape_features(args)
-        shape_hash = hashlib.sha256(
-            json.dumps(shape_features, sort_keys=True).encode()
-        ).hexdigest()[:16]
-
-        # Check if we already have a cached result for this kernel+shape
-        cache_key = (kernel_source_file, kernel_name, shape_hash)
+        cache_key = self._heuristic_cache_key(args)
         if cache_key in AOTAutotuneCache._heuristic_results:
             log.debug(
-                f"Using cached heuristic result for {kernel_name} shape={shape_hash}"
+                f"Using cached heuristic result for {kernel_name} key={cache_key}"
             )
             return AOTAutotuneCache._heuristic_results[cache_key]
 
@@ -777,7 +841,7 @@ class AOTAutotuneCache(AutotuneCacheBase):
             if config is not None:
                 AOTAutotuneCache._heuristic_results[cache_key] = config
                 log.debug(
-                    f"Cached heuristic result for {kernel_name} shape={shape_hash}"
+                    f"Cached heuristic result for {kernel_name} key={cache_key}"
                 )
 
             return config

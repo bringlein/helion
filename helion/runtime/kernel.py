@@ -1184,7 +1184,31 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             assert self._run is not None
             self.maybe_log_repro(log.warning, args)
 
+        if self.kernel.settings.autotune_cache == "AOTAutotuneCache":
+            return self._run_aot_with_retry(args)
         return self._run(*args)
+
+    def _run_aot_with_retry(self, args: tuple[object, ...]) -> _R:
+        """Launch an AOT kernel, retrying with another cached config if the
+        selected one fails to launch (e.g. triton OutOfResources on this
+        hardware). The failing config is excluded for this specialization key
+        so subsequent calls skip straight to a valid config."""
+        from torch._inductor.runtime.triton_compat import OutOfResources
+
+        from ..autotuner.aot_cache import mark_aot_config_failed
+
+        while True:
+            assert self._run is not None
+            try:
+                return self._run(*args)
+            except OutOfResources:
+                if not mark_aot_config_failed(self.kernel, args):
+                    raise
+                # Force re-pick + recompile with the next cached candidate.
+                self._run = None
+                self._config = None
+                self.ensure_config_exists(args)
+
 
     def backend_cache_key(self, config: ConfigLike | None = None) -> str | None:
         """
