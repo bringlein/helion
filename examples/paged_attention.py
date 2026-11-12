@@ -71,6 +71,13 @@ def _next_power_of_2(n: int) -> int:
 # autotuner measures these per specialization key and keeps the fastest;
 # configs whose q_block exceeds the ladder ceiling of a key (the prefill
 # shapes under a decode key) are dropped automatically.
+#
+# These shapes were tuned for the serving regimes above (GQA with
+# num_queries_per_kv == 4, head_dim 128, page_size 16) and are not necessarily
+# equally good for every batch: other head counts, head dims or page sizes shift
+# both the ideal query tile and the KV tile, so a deployment should drop this
+# list (letting the autotuner search the full space) or replace it with shapes
+# measured on its own distribution.
 DEFAULT_CONFIGS = [
     # prefill / mixed: wide query tile
     helion.Config(block_sizes=[32, 4, 4], num_warps=4, num_stages=2, pid_type="flat"),
@@ -141,6 +148,7 @@ def paged_attention_kernel(
 
     out = torch.empty_like(q)
 
+    # pyrefly: ignore[bad-argument-type]
     q_block_size = hl.register_block_size(1, q_block_padded_size)
     num_pages_at_once = hl.register_block_size(1, 32)
     num_pages_at_once_full = hl.register_block_size(1, 32)
@@ -157,7 +165,7 @@ def paged_attention_kernel(
         # vectorized gid -> seq_idx: cu_seqlens_q // q_block + s is monotone
         # in s, so the sequence owning this block is the rank of gid among
         # the per-sequence block starts
-        s_idx = hl.arange(num_seqs_padded)
+        s_idx = hl.arange(num_seqs_padded)  # pyrefly: ignore[bad-argument-type]
         valid = s_idx < num_seqs
         cu = hl.load(cu_seqlens_q, [s_idx], extra_mask=valid)
         starts = cu // q_block_size + s_idx
@@ -208,12 +216,23 @@ def paged_attention_kernel(
             ) * num_pages_at_once_full
             full_pages = torch.minimum(full_pages, num_blocks)
 
+            # Splitting the loop is a hand-applied optimization for GPU-like
+            # targets. It pays off here because the masked body costs two
+            # extra ``torch.where`` passes over the k/v tiles plus the mask
+            # On a target where predication is close to free, or where a
+            # second loop nest is expensive (extra prologue, instruction
+            # cache, fixed tile shapes of a matmul unit), the single masked
+            # loop can be superiror. Future compiler passes could automate
+            # loop splits like this (since the range is monotonic).
             # ── full tiles: no causal mask, no seq_len zero-fill ──────────
             for tile_p in hl.tile(full_pages, block_size=num_pages_at_once_full):
                 page_ids = hl.load(
                     block_tables_flat,
-                    [block_table_offset + tile_p.begin
-                     + hl.arange(num_pages_at_once_full)],
+                    [
+                        block_table_offset
+                        + tile_p.begin
+                        + hl.arange(num_pages_at_once_full)
+                    ],
                 )
                 page_ids = page_ids.view([num_pages_at_once_full]).to(torch.int64)
                 block_n = num_pages_at_once_full * page_size
@@ -233,13 +252,10 @@ def paged_attention_kernel(
                 m_i = m_new
 
             # ── boundary tiles around the diagonal: masked body ──────────
-            for tile_p in hl.tile(
-                full_pages, num_blocks, block_size=num_pages_at_once
-            ):
+            for tile_p in hl.tile(full_pages, num_blocks, block_size=num_pages_at_once):
                 page_ids = hl.load(
                     block_tables_flat,
-                    [block_table_offset + tile_p.begin
-                     + hl.arange(num_pages_at_once)],
+                    [block_table_offset + tile_p.begin + hl.arange(num_pages_at_once)],
                 )
                 page_ids = page_ids.view([num_pages_at_once]).to(torch.int64)
                 block_n = num_pages_at_once * page_size
@@ -391,19 +407,22 @@ def test(
     if query_lens is None:
         query_lens = [1, 1, 1, 128, 512, 2048, 333, 1]
         seq_lens = [4096, 1023, 77, 512, 1024, 2048, 1000, 3]
+    assert seq_lens is not None and len(seq_lens) == len(query_lens)
 
     cu_seqlens_q = [0]
     for n in query_lens:
         cu_seqlens_q.append(cu_seqlens_q[-1] + n)
-    q = torch.randn(
-        cu_seqlens_q[-1], num_heads, head_dim, dtype=dtype, device=device
-    )
+    q = torch.randn(cu_seqlens_q[-1], num_heads, head_dim, dtype=dtype, device=device)
 
     # page pool with a disjoint page range per sequence
     pages_per_seq = [(n + page_size - 1) // page_size for n in seq_lens]
     key_cache = torch.randn(
-        sum(pages_per_seq), page_size, num_kv_heads, head_dim,
-        dtype=dtype, device=device,
+        sum(pages_per_seq),
+        page_size,
+        num_kv_heads,
+        head_dim,
+        dtype=dtype,
+        device=device,
     )
     value_cache = torch.randn_like(key_cache)
     block_table = torch.zeros(
