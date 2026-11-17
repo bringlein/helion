@@ -32,6 +32,12 @@ straddle KV heads):
   backend's SIMT lowering refuses for any consumer that reads the result at
   its new position, while 2-D loads, gathers, transposes and dots lower on
   every backend.
+- **Active contraction tile**: the scores dot contracts ``head_dim``
+  through its own tile loop (``block_k``, equal to ``head_dim`` in the
+  default configs), instead of a single dot over a free static extent: the
+  CuTe dot lowering requires an active tile on the contraction axis, and
+  both operands are re-read per chunk, which is also the CuTe execution
+  model. Triton lowers both forms identically up to fp reassociation.
 - **Online (flash-style) softmax** with ``exp2`` (``log2(e)`` is folded into
   the scale host-side) over KV tiles gathered page by page.
 - **KV loop split** at the causal diagonal: column tiles entirely below the
@@ -82,11 +88,13 @@ def _next_power_of_2(n: int) -> int:
 
 
 # Default tile shapes, measured on the source kernel: block_sizes are
-# (query rows, boundary kv columns, full kv columns), where query rows are
-# num_queries_per_kv * queries per tile and kv columns are pages *
-# page_size. The autotuner measures these per specialization key and keeps
-# the fastest; configs whose query tile exceeds the ladder ceiling of a key
-# (the prefill shapes under a decode key) are dropped automatically.
+# (query rows, boundary kv columns, full kv columns, head-dim chunk of the
+# scores dot), where query rows are num_queries_per_kv * queries per tile,
+# kv columns are pages * page_size, and the head-dim chunk must divide
+# head_dim (block_k == head_dim restores the single-dot form). The
+# autotuner measures these per specialization key and keeps the fastest;
+# configs whose query tile exceeds the ladder ceiling of a key (the
+# prefill shapes under a decode key) are dropped automatically.
 #
 # These shapes were tuned for the serving regimes above (GQA with
 # num_queries_per_kv == 4, head_dim 128, page_size 16) and are not
@@ -97,19 +105,19 @@ def _next_power_of_2(n: int) -> int:
 DEFAULT_CONFIGS = [
     # prefill / mixed: wide query tile
     helion.Config(
-        block_sizes=[128, 64, 64], num_warps=4, num_stages=2, pid_type="flat"
+        block_sizes=[128, 64, 64, 128], num_warps=4, num_stages=2, pid_type="flat"
     ),
     # short prefill: narrower KV tile
     helion.Config(
-        block_sizes=[128, 32, 32], num_warps=4, num_stages=2, pid_type="flat"
+        block_sizes=[128, 32, 32, 128], num_warps=4, num_stages=2, pid_type="flat"
     ),
     # decode: minimal query tile, moderate KV tile
     helion.Config(
-        block_sizes=[4, 64, 64], num_warps=4, num_stages=2, pid_type="flat"
+        block_sizes=[4, 64, 64, 128], num_warps=4, num_stages=2, pid_type="flat"
     ),
     # decode with a longer KV tile
     helion.Config(
-        block_sizes=[4, 128, 128], num_warps=4, num_stages=2, pid_type="flat"
+        block_sizes=[4, 128, 128, 128], num_warps=4, num_stages=2, pid_type="flat"
     ),
 ]
 
@@ -176,6 +184,10 @@ def paged_attention_kernel(
     kv_row_stride = hl.specialize(key_cache.size(1))
     num_queries_per_kv = num_heads // num_kv_heads
     assert page_size * num_kv_heads * head_dim == kv_row_stride == value_cache.size(1)
+    # block sizes are powers of two, so every head-dim chunk of the scores
+    # dot must divide head_dim exactly: a partial chunk would feed masked
+    # load fills into the dot
+    assert (head_dim & (head_dim - 1)) == 0
 
     out = torch.empty_like(q)
 
@@ -183,6 +195,7 @@ def paged_attention_kernel(
     block_m = hl.register_block_size(1, q_rows_padded_size)
     block_n = hl.register_block_size(1, 32 * page_size)
     block_n_full = hl.register_block_size(1, 32 * page_size)
+    block_k = hl.register_block_size(min(16, head_dim), head_dim)
 
     # upper bound on the total number of q blocks: each sequence contributes
     # at most its query rows // block_m + 1 blocks
@@ -220,10 +233,10 @@ def paged_attention_kernel(
         if q_row_offset < query_len * num_queries_per_kv:
             kv_head = tile_h.begin // num_queries_per_kv
 
-            # query tile [block_m, head_dim], loaded in its final shape so
-            # no reshape ever merges tile dimensions: row m is the (token,
-            # head) pair of the group, i.e. token query_start + m // group
-            # and head tile_h.begin + m % group
+            # query rows for the scores dot: row m is the (token, head)
+            # pair of the group, i.e. token query_start + m // group and
+            # head tile_h.begin + m % group; q is loaded per head-dim chunk
+            # inside the KV loops
             row = q_row_offset + hl.arange(block_m)
             q_pos = row // num_queries_per_kv
             token = query_start + q_pos
@@ -231,9 +244,6 @@ def paged_attention_kernel(
                 token * num_heads + tile_h.begin + row % num_queries_per_kv
             )
             q_mask = token < query_end
-            qt = hl.load(
-                q, [q_flat_row, hl.arange(head_dim)], extra_mask=q_mask[:, None]
-            )
 
             m_i = hl.full([block_m], float("-inf"), dtype=torch.float32)
             l_i = hl.full([block_m], 1.0, dtype=torch.float32)
@@ -283,11 +293,26 @@ def paged_attention_kernel(
                     + (kv_pos % page_size) * (num_kv_heads * head_dim)
                     + kv_head * head_dim
                 )
-                k = hl.load(key_cache, [col, hl.arange(head_dim)])
                 v = hl.load(value_cache, [col, hl.arange(head_dim)])
-                k = k.transpose(0, 1)
 
-                scores = hl.dot(qt, k, out_dtype=torch.float32) * scale
+                # the scores dot contracts head_dim in chunks of an active
+                # tile loop: the CuTe dot lowering requires the contraction
+                # dim to be an active tile (block_k == head_dim restores the
+                # single-dot form), and both operands are re-read per chunk
+                scores = hl.zeros([block_m, block_n_full], dtype=torch.float32)
+                for tile_d in hl.tile(head_dim, block_size=block_k):
+                    qk = hl.load(
+                        q, [q_flat_row, tile_d], extra_mask=q_mask[:, None]
+                    )
+                    kk = hl.load(key_cache, [col, tile_d])
+                    scores = hl.dot(
+                        qk,
+                        kk.transpose(0, 1),
+                        out_dtype=torch.float32,
+                        acc=scores,
+                    )
+                scores = scores * scale
+
                 m_new = torch.maximum(m_i, torch.amax(scores, 1))
                 p = torch.exp2(scores - m_new[:, None])
                 alpha = torch.exp2(m_i - m_new)
@@ -317,18 +342,29 @@ def paged_attention_kernel(
                     + (kv_pos % page_size) * (num_kv_heads * head_dim)
                     + kv_head * head_dim
                 )
-                k = hl.load(key_cache, [col, hl.arange(head_dim)])
                 v = hl.load(value_cache, [col, hl.arange(head_dim)])
                 # absolute kv position of every column; zero-fill past
                 # seq_len so the partial last page and the clamped tail of
                 # the block table are harmless
                 kv_valid = kv_pos < seq_len
-                pad = hl.zeros([block_n, head_dim], dtype=k.dtype)
-                k = torch.where(kv_valid[:, None], k, pad)
+                pad = hl.zeros([block_n, head_dim], dtype=v.dtype)
                 v = torch.where(kv_valid[:, None], v, pad)
-                k = k.transpose(0, 1)
 
-                scores = hl.dot(qt, k, out_dtype=torch.float32) * scale
+                scores = hl.zeros([block_m, block_n], dtype=torch.float32)
+                for tile_d in hl.tile(head_dim, block_size=block_k):
+                    qk = hl.load(
+                        q, [q_flat_row, tile_d], extra_mask=q_mask[:, None]
+                    )
+                    kk = hl.load(key_cache, [col, tile_d])
+                    pad_k = hl.zeros([block_n, block_k], dtype=kk.dtype)
+                    kk = torch.where(kv_valid[:, None], kk, pad_k)
+                    scores = hl.dot(
+                        qk,
+                        kk.transpose(0, 1),
+                        out_dtype=torch.float32,
+                        acc=scores,
+                    )
+                scores = scores * scale
                 # causal mask: query position i attends to kv < context_len + i + 1
                 scores = torch.where(
                     kv_pos[None, :] < context_len + q_pos[:, None] + 1,
