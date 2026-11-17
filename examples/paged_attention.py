@@ -13,8 +13,8 @@ Based on the PyTorch blog post "Portable paged attention in Helion"
 vLLM Triton attention backend ``triton_unified_attention.py``:
 https://github.com/vllm-project/vllm/blob/main/vllm/v1/attention/ops/triton_unified_attention.py
 
-Structure of the kernel (GQA supported; a query tile covers all query heads
-of one KV head, so a tile never straddles KV heads):
+Structure of the kernel (GQA supported; the rows of a query tile never
+straddle KV heads):
 
 - **Flat q-block grid**: programs are indexed by a global q-block id and
   resolve their sequence through a vectorized rank reduction over
@@ -22,17 +22,27 @@ of one KV head, so a tile never straddles KV heads):
   grid, which over-provisions for skewed batches. Because the sequence index
   is computed on the device, the block table is passed flattened with an
   explicit row stride.
+- **Reshape-free tiles**: the wrapper flattens ``q`` and the caches into 2-D
+  views (free for contiguous tensors), and every tile is loaded in its final
+  shape. A query tile is ``[block_m, head_dim]``, where row ``m`` is the
+  (token, head) pair ``query_start + m // group`` / ``tile_h.begin + m %
+  group``; a KV tile is ``[block_n, head_dim]`` gathered through computed
+  flat column ids. No reshape, flatten or repeat ever merges tile
+  dimensions: such a merge moves elements between threads, which the CuTe
+  backend's SIMT lowering refuses for any consumer that reads the result at
+  its new position, while 2-D loads, gathers, transposes and dots lower on
+  every backend.
 - **Online (flash-style) softmax** with ``exp2`` (``log2(e)`` is folded into
   the scale host-side) over KV tiles gathered page by page.
-- **KV loop split** at the causal diagonal: page tiles entirely below the
+- **KV loop split** at the causal diagonal: column tiles entirely below the
   diagonal are visible to every query row of the block, so they run without
   the causal mask and the ``seq_len`` zero-fill; only the boundary tiles
   around the diagonal carry masks. Each loop gets its own block size.
-- **Ladder specialization**: ``q_block_padded_size`` is the query length
-  rounded up to a power of two (the ceiling of the q-block block size), so
-  decode and prefill batches of different lengths autotune separately.
-  At the same time, the ladder is required to not compile & autotune every
-  different shape that happens to be scheduled by vLLM.
+- **Ladder specialization**: ``q_rows_padded_size`` is the query length
+  rounded up to a power of two (times the GQA group), so decode and prefill
+  batches of different lengths autotune separately. At the same time, the
+  ladder is required to not compile & autotune every different shape that
+  happens to be scheduled by vLLM.
 - **Default configs**: a small list of tile shapes covering the serving
   regimes. The autotuner measures them per specialization key and keeps
   the fastest, which keeps the example quick and deterministic — but the
@@ -62,7 +72,8 @@ import helion.language as hl
 # log2(e), folded into the softmax scale so the kernel can use exp2
 LOG2E = 1.4426950408889634
 
-# ceiling of the q_block_padded_size ladder
+# ceiling of the ladder, in query tokens (the kernel's ceiling is this
+# times the GQA group, in packed query rows)
 MAX_Q_BLOCK_PADDED = 8192
 
 
@@ -71,27 +82,35 @@ def _next_power_of_2(n: int) -> int:
 
 
 # Default tile shapes, measured on the source kernel: block_sizes are
-# (q_block, boundary pages, full pages), block_m is
-# num_queries_per_kv * q_block and block_n is pages * page_size. The
-# autotuner measures these per specialization key and keeps the fastest;
-# configs whose q_block exceeds the ladder ceiling of a key (the prefill
-# shapes under a decode key) are dropped automatically.
+# (query rows, boundary kv columns, full kv columns), where query rows are
+# num_queries_per_kv * queries per tile and kv columns are pages *
+# page_size. The autotuner measures these per specialization key and keeps
+# the fastest; configs whose query tile exceeds the ladder ceiling of a key
+# (the prefill shapes under a decode key) are dropped automatically.
 #
 # These shapes were tuned for the serving regimes above (GQA with
-# num_queries_per_kv == 4, head_dim 128, page_size 16) and are not necessarily
-# equally good for every batch: other head counts, head dims or page sizes shift
-# both the ideal query tile and the KV tile, so a deployment should drop this
-# list (letting the autotuner search the full space) or replace it with shapes
-# measured on its own distribution.
+# num_queries_per_kv == 4, head_dim 128, page_size 16) and are not
+# necessarily equally good for every batch: other head counts, head dims or
+# page sizes shift both the ideal query tile and the KV tile, so a
+# deployment should drop this list (letting the autotuner search the full
+# space) or replace it with shapes measured on its own distribution.
 DEFAULT_CONFIGS = [
     # prefill / mixed: wide query tile
-    helion.Config(block_sizes=[32, 4, 4], num_warps=4, num_stages=2, pid_type="flat"),
+    helion.Config(
+        block_sizes=[128, 64, 64], num_warps=4, num_stages=2, pid_type="flat"
+    ),
     # short prefill: narrower KV tile
-    helion.Config(block_sizes=[32, 2, 2], num_warps=4, num_stages=2, pid_type="flat"),
+    helion.Config(
+        block_sizes=[128, 32, 32], num_warps=4, num_stages=2, pid_type="flat"
+    ),
     # decode: minimal query tile, moderate KV tile
-    helion.Config(block_sizes=[1, 4, 4], num_warps=4, num_stages=2, pid_type="flat"),
+    helion.Config(
+        block_sizes=[4, 64, 64], num_warps=4, num_stages=2, pid_type="flat"
+    ),
     # decode with a longer KV tile
-    helion.Config(block_sizes=[1, 8, 8], num_warps=4, num_stages=2, pid_type="flat"),
+    helion.Config(
+        block_sizes=[4, 128, 128], num_warps=4, num_stages=2, pid_type="flat"
+    ),
 ]
 
 # %%
@@ -111,25 +130,28 @@ DEFAULT_CONFIGS = [
     index_dtype=torch.int64,
 )
 def paged_attention_kernel(
-    q: torch.Tensor,  # [total_q_tokens, num_heads, head_dim]
-    key_cache: torch.Tensor,  # [num_pages, page_size, num_kv_heads, head_dim]
-    value_cache: torch.Tensor,  # [num_pages, page_size, num_kv_heads, head_dim]
+    q: torch.Tensor,  # [total_q_tokens * num_heads, head_dim]
+    key_cache: torch.Tensor,  # [num_pages, page_size * num_kv_heads * head_dim]
+    value_cache: torch.Tensor,  # same layout as key_cache
     block_tables_flat: torch.Tensor,  # [num_seqs * block_table_stride]
     block_table_stride: int,
     seq_lens: torch.Tensor,  # [num_seqs]
     cu_seqlens_q: torch.Tensor,  # [num_seqs + 1] query-token offsets
     scale: float,  # sm_scale * LOG2E
     num_seqs: int,
-    q_block_padded_size: hl.constexpr,
+    num_heads: int,
+    num_kv_heads: int,
+    page_size: int,
+    q_rows_padded_size: hl.constexpr,
     num_seqs_padded: hl.constexpr,
 ) -> torch.Tensor:
     """
     Computes causal attention over a paged KV cache; see the module docstring.
 
     Args:
-        q: Packed queries, where token ``cu_seqlens_q[s] + i`` is query
-            position ``i`` of sequence ``s``.
-        key_cache: Pooled keys [num_pages, page_size, num_kv_heads, head_dim].
+        q: Packed queries flattened to rows ``token * num_heads + head``.
+        key_cache: Pooled keys, each page flattened to one row of
+            ``page_size * num_kv_heads * head_dim`` elements.
         value_cache: Pooled values, same layout as ``key_cache``.
         block_tables_flat: The block table flattened to one row per sequence
             of length ``block_table_stride``.
@@ -137,43 +159,47 @@ def paged_attention_kernel(
         cu_seqlens_q: Exclusive scan of the per-sequence query lengths.
         scale: Softmax scale pre-multiplied by ``log2(e)``.
         num_seqs: Number of sequences in the batch.
-        q_block_padded_size: Ladder bucket, ``next_power_of_2(max_query_len)``.
+        num_heads: Number of query heads.
+        num_kv_heads: Number of KV heads; divides ``num_heads``.
+        page_size: Token rows of the KV cache per page.
+        q_rows_padded_size: Ladder bucket, ``next_power_of_2(max_query_len)
+            * num_queries_per_kv``; the ceiling of the query tile's rows.
         num_seqs_padded: Width of the ``gid -> seq_idx`` reduction vector.
 
     Returns:
-        Output tensor of shape [total_q_tokens, num_heads, head_dim].
+        Output tensor of shape [total_q_tokens * num_heads, head_dim].
     """
-    num_heads = hl.specialize(q.size(1))
-    head_dim = hl.specialize(q.size(2))
-    num_kv_heads = hl.specialize(key_cache.size(2))
-    page_size = hl.specialize(key_cache.size(1))
-    num_queries_per_kv = hl.specialize(num_heads // num_kv_heads)
-    assert page_size == value_cache.size(1)
-    assert head_dim == key_cache.size(3) == value_cache.size(3)
+    num_heads = hl.specialize(num_heads)
+    num_kv_heads = hl.specialize(num_kv_heads)
+    page_size = hl.specialize(page_size)
+    head_dim = hl.specialize(q.size(1))
+    kv_row_stride = hl.specialize(key_cache.size(1))
+    num_queries_per_kv = num_heads // num_kv_heads
+    assert page_size * num_kv_heads * head_dim == kv_row_stride == value_cache.size(1)
 
     out = torch.empty_like(q)
 
     # pyrefly: ignore[bad-argument-type]
-    q_block_size = hl.register_block_size(1, q_block_padded_size)
-    num_pages_at_once = hl.register_block_size(1, 32)
-    num_pages_at_once_full = hl.register_block_size(1, 32)
+    block_m = hl.register_block_size(1, q_rows_padded_size)
+    block_n = hl.register_block_size(1, 32 * page_size)
+    block_n_full = hl.register_block_size(1, 32 * page_size)
 
     # upper bound on the total number of q blocks: each sequence contributes
-    # at most total_q_tokens // q_block_size + 1 blocks
-    num_q_blocks = q.size(0) // q_block_size + num_seqs
+    # at most its query rows // block_m + 1 blocks
+    num_q_blocks = q.size(0) // num_kv_heads // block_m + num_seqs
 
     for q_blk_tile, tile_h in hl.tile(
         [num_q_blocks, num_heads], block_size=[1, num_queries_per_kv]
     ):
         gid = q_blk_tile.begin
 
-        # vectorized gid -> seq_idx: cu_seqlens_q // q_block + s is monotone
-        # in s, so the sequence owning this block is the rank of gid among
-        # the per-sequence block starts
+        # vectorized gid -> seq_idx: cu_seqlens_q * group // block_m + s is
+        # monotone in s, so the sequence owning this block is the rank of
+        # gid among the per-sequence block starts
         s_idx = hl.arange(num_seqs_padded)  # pyrefly: ignore[bad-argument-type]
         valid = s_idx < num_seqs
         cu = hl.load(cu_seqlens_q, [s_idx], extra_mask=valid)
-        starts = cu // q_block_size + s_idx
+        starts = (cu * num_queries_per_kv) // block_m + s_idx
         seq_idx = torch.sum(((starts <= gid) & valid).to(torch.int32)) - 1
 
         seq_len = seq_lens[seq_idx]
@@ -181,45 +207,58 @@ def paged_attention_kernel(
         query_end = cu_seqlens_q[seq_idx + 1]
         query_len = query_end - query_start
         context_len = seq_len - query_len
-        q_block_offset = (gid - (query_start // q_block_size + seq_idx)) * q_block_size
+        # row offset (in packed query rows) of this q block within its
+        # sequence
+        q_row_offset = (
+            gid - ((query_start * num_queries_per_kv) // block_m + seq_idx)
+        ) * block_m
         # flat row offset into the block table; the 2-D form cannot be
         # lowered when seq_idx is a device-computed scalar
         block_table_offset = seq_idx * block_table_stride
 
-        # blocks past this sequence's last q block are padding
-        if q_block_offset < query_len:
-            block_m = num_queries_per_kv * q_block_size
+        # blocks past this sequence's last row are padding
+        if q_row_offset < query_len * num_queries_per_kv:
             kv_head = tile_h.begin // num_queries_per_kv
 
-            # q tile [q_block, num_queries_per_kv, head_dim] -> [block_m, head_dim]
-            q_idx = query_start + q_block_offset + hl.arange(q_block_size)
-            head_idx = tile_h.begin + hl.arange(num_queries_per_kv)
-            q_mask = q_idx[:, None, None] < query_end
-            qt = hl.load(q, [q_idx, head_idx, hl.arange(head_dim)], extra_mask=q_mask)
-            qt = qt.flatten(start_dim=0, end_dim=1)
+            # query tile [block_m, head_dim], loaded in its final shape so
+            # no reshape ever merges tile dimensions: row m is the (token,
+            # head) pair of the group, i.e. token query_start + m // group
+            # and head tile_h.begin + m % group
+            row = q_row_offset + hl.arange(block_m)
+            q_pos = row // num_queries_per_kv
+            token = query_start + q_pos
+            q_flat_row = (
+                token * num_heads + tile_h.begin + row % num_queries_per_kv
+            )
+            q_mask = token < query_end
+            qt = hl.load(
+                q, [q_flat_row, hl.arange(head_dim)], extra_mask=q_mask[:, None]
+            )
 
             m_i = hl.full([block_m], float("-inf"), dtype=torch.float32)
             l_i = hl.full([block_m], 1.0, dtype=torch.float32)
             acc = hl.zeros([block_m, head_dim], dtype=torch.float32)
 
             # causal bound: no row of this q block sees kv beyond
-            # context_len + q_block_offset + q_block_size
+            # context_len + (the block's last query position) + 1
             kv_bound = torch.minimum(
-                context_len + q_block_offset + q_block_size, seq_len
+                context_len
+                + (q_row_offset + block_m - 1) // num_queries_per_kv
+                + 1,
+                seq_len,
             )
             num_blocks = (kv_bound + page_size - 1) // page_size
+            kv_end = num_blocks * page_size
 
             # first kv position not visible to *every* row of the q block;
-            # page tiles entirely below it need neither causal mask nor
+            # column tiles entirely below it need neither causal mask nor
             # seq_len zero-fill, so the KV loop splits in two. No NaN hazard:
-            # if full_pages > 0 every row enters the boundary loop with
+            # if full_cols > 0 every row enters the boundary loop with
             # finite m_i; otherwise the first boundary tile contains kv
             # position 0, which is visible to every row.
-            diag_start = context_len + q_block_offset + 1
-            full_pages = (
-                diag_start // (num_pages_at_once_full * page_size)
-            ) * num_pages_at_once_full
-            full_pages = torch.minimum(full_pages, num_blocks)
+            diag_start = context_len + q_row_offset // num_queries_per_kv + 1
+            full_cols = (diag_start // block_n_full) * block_n_full
+            full_cols = torch.minimum(full_cols, kv_end)
 
             # Splitting the loop is a hand-applied optimization for GPU-like
             # targets. It pays off here because the masked body costs two
@@ -230,22 +269,23 @@ def paged_attention_kernel(
             # loop can be superiror. Future compiler passes could automate
             # loop splits like this (since the range is monotonic).
             # ── full tiles: no causal mask, no seq_len zero-fill ──────────
-            for tile_p in hl.tile(full_pages, block_size=num_pages_at_once_full):
-                page_ids = hl.load(
+            for tile_n in hl.tile(full_cols, block_size=block_n_full):
+                kv_pos = tile_n.begin + hl.arange(block_n_full)
+                # every column is below the diagonal and thus inside the
+                # sequence's pages, so the page lookup is always in-row
+                page = hl.load(
                     block_tables_flat,
-                    [
-                        block_table_offset
-                        + tile_p.begin
-                        + hl.arange(num_pages_at_once_full)
-                    ],
+                    [block_table_offset + kv_pos // page_size],
                 )
-                page_ids = page_ids.view([num_pages_at_once_full]).to(torch.int64)
-                block_n = num_pages_at_once_full * page_size
-
-                k = key_cache[page_ids, :, kv_head, :]
-                k = k.flatten(start_dim=0, end_dim=1).transpose(0, 1)
-                v = value_cache[page_ids, :, kv_head, :]
-                v = v.flatten(start_dim=0, end_dim=1)
+                page = page.view([block_n_full]).to(torch.int64)
+                col = (
+                    page * kv_row_stride
+                    + (kv_pos % page_size) * (num_kv_heads * head_dim)
+                    + kv_head * head_dim
+                )
+                k = hl.load(key_cache, [col, hl.arange(head_dim)])
+                v = hl.load(value_cache, [col, hl.arange(head_dim)])
+                k = k.transpose(0, 1)
 
                 scores = hl.dot(qt, k, out_dtype=torch.float32) * scale
                 m_new = torch.maximum(m_i, torch.amax(scores, 1))
@@ -257,34 +297,41 @@ def paged_attention_kernel(
                 m_i = m_new
 
             # ── boundary tiles around the diagonal: masked body ──────────
-            for tile_p in hl.tile(full_pages, num_blocks, block_size=num_pages_at_once):
-                page_ids = hl.load(
+            for tile_n in hl.tile(full_cols, kv_end, block_size=block_n):
+                kv_pos = tile_n.begin + hl.arange(block_n)
+                # the last tile can overshoot the sequence's pages; clamp
+                # the page lookup into the sequence's valid pages (the
+                # overshoot columns are zero-filled below)
+                page = hl.load(
                     block_tables_flat,
-                    [block_table_offset + tile_p.begin + hl.arange(num_pages_at_once)],
+                    [
+                        block_table_offset
+                        + torch.minimum(
+                            kv_pos // page_size, (seq_len - 1) // page_size
+                        )
+                    ],
                 )
-                page_ids = page_ids.view([num_pages_at_once]).to(torch.int64)
-                block_n = num_pages_at_once * page_size
-
-                k = key_cache[page_ids, :, kv_head, :]
-                k = k.flatten(start_dim=0, end_dim=1)
-                v = value_cache[page_ids, :, kv_head, :]
-                v = v.flatten(start_dim=0, end_dim=1)
+                page = page.view([block_n]).to(torch.int64)
+                col = (
+                    page * kv_row_stride
+                    + (kv_pos % page_size) * (num_kv_heads * head_dim)
+                    + kv_head * head_dim
+                )
+                k = hl.load(key_cache, [col, hl.arange(head_dim)])
+                v = hl.load(value_cache, [col, hl.arange(head_dim)])
                 # absolute kv position of every column; zero-fill past
-                # seq_len so the partial last page and the zero-padded tail
-                # of the block table are harmless
-                kv_pos = tile_p.begin * page_size + hl.arange(block_n)
+                # seq_len so the partial last page and the clamped tail of
+                # the block table are harmless
+                kv_valid = kv_pos < seq_len
                 pad = hl.zeros([block_n, head_dim], dtype=k.dtype)
-                k = torch.where(kv_pos[:, None] < seq_len, k, pad)
-                v = torch.where(kv_pos[:, None] < seq_len, v, pad)
+                k = torch.where(kv_valid[:, None], k, pad)
+                v = torch.where(kv_valid[:, None], v, pad)
                 k = k.transpose(0, 1)
 
                 scores = hl.dot(qt, k, out_dtype=torch.float32) * scale
                 # causal mask: query position i attends to kv < context_len + i + 1
-                q_row = (q_block_offset + hl.arange(q_block_size)).repeat_interleave(
-                    num_queries_per_kv, dim=0
-                )
                 scores = torch.where(
-                    kv_pos[None, :] < context_len + q_row[:, None] + 1,
+                    kv_pos[None, :] < context_len + q_pos[:, None] + 1,
                     scores,
                     float("-inf"),
                 )
@@ -300,9 +347,9 @@ def paged_attention_kernel(
             acc = acc / l_i[:, None]
             hl.store(
                 out,
-                [q_idx, tile_h.index, hl.arange(head_dim)],
-                acc.view([q_block_size, num_queries_per_kv, head_dim]),
-                extra_mask=q_mask,
+                [q_flat_row, hl.arange(head_dim)],
+                acc,
+                extra_mask=q_mask[:, None],
             )
     return out
 
@@ -321,13 +368,16 @@ def paged_attention(
     """
     Computes causal attention over a paged KV cache.
 
-    Same argument contract as :func:`paged_attention_reference`; derives the
-    specialization key and launches the kernel.
+    Same argument contract as :func:`paged_attention_reference`; flattens
+    ``q`` and the caches into the 2-D layouts the kernel gathers from (free
+    views of contiguous tensors) and views the result back to ``q``'s shape.
     """
-    return paged_attention_kernel(
-        q,
-        key_cache,
-        value_cache,
+    num_queries_per_kv = q.size(1) // key_cache.size(2)
+    q_rows_padded = min(MAX_Q_BLOCK_PADDED, _next_power_of_2(max_query_len))
+    out = paged_attention_kernel(
+        q.reshape(-1, q.size(2)),
+        key_cache.reshape(key_cache.size(0), -1),
+        value_cache.reshape(value_cache.size(0), -1),
         # seq_idx is device-computed, so the block table travels flattened
         block_table.reshape(-1),
         block_table.stride(0),
@@ -335,14 +385,18 @@ def paged_attention(
         cu_seqlens_q,
         sm_scale * LOG2E,
         seq_lens.size(0),
+        q.size(1),
+        key_cache.size(2),
+        key_cache.size(1),
         # ladder: one autotune bucket per power-of-two query length. It is
         # necessary because decode and prefill batches want opposite tile
         # shapes, so a single shared config would fit neither, and because
-        # the bucket is also the ceiling of the q_block block size — without
+        # the bucket is also the ceiling of the query tile's rows — without
         # raising it, long prefills cannot reach wide query tiles.
-        q_block_padded_size=min(MAX_Q_BLOCK_PADDED, _next_power_of_2(max_query_len)),
+        q_rows_padded_size=q_rows_padded * num_queries_per_kv,
         num_seqs_padded=_next_power_of_2(seq_lens.size(0)),
     )
+    return out.view(q.shape)
 
 
 # %%
@@ -462,15 +516,16 @@ def test(
 
 # %%
 # Main Function
-# -------------
+# ------------
 
 
 # %%
 def main() -> None:
     """Runs the example on a mixed batch and a pure-decode batch."""
     test()
-    # pure decode: the ladder keys this batch at q_block_padded_size == 1,
-    # so it autotunes separately from the prefill batch above
+    # pure decode: the ladder keys this batch at q_rows_padded_size == 1 *
+    # num_queries_per_kv, so it autotunes separately from the prefill batch
+    # above
     test(query_lens=[1] * 32, seq_lens=[1024 + 7 * i for i in range(32)])
 
 
